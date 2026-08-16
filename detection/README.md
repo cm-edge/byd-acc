@@ -5,7 +5,7 @@ scripts consume. Instead of committing the (large) precomputed detection
 `.txt` files, download the public datasets into the expected layout and run the
 detector here.
 
-**MOT17 is handled separately** by `scoring/compute_mot17_detections.py` — this
+**MOT17 is handled separately** by `scoring/compute_mot17_detections.py`. This
 module only covers UA-DETRAC and UAVDT.
 
 ## Models
@@ -34,9 +34,9 @@ detections (same trap documented in `scoring/compute_mot17_detections.py`).
 One line per detection: `frame_id, obj_id, left, top, width, height, conf, class_name`
 
 - `frame_id`: 1-based, frame-sort order.
-- `obj_id`: per-frame sequential id. **Nothing downstream uses this column** —
+- `obj_id`: per-frame sequential id. **Nothing downstream uses this column.**
   PTC re-matches detections by IoU and XGBoost rebuilds its own internal IoU
-  tracker — so its exact value is irrelevant. No external tracker is involved.
+  tracker, so its exact value is irrelevant. No external tracker is involved.
 
 ## Expected dataset layout
 

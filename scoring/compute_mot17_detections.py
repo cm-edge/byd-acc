@@ -114,7 +114,8 @@ def _save_xml(xml_path: Path, filename: str,
 # Detection runner
 # ---------------------------------------------------------------------------
 def run_detector_on_seq(model, transform, seq_img_dir: Path,
-                        xml_out_dir: Path, skip_existing: bool):
+                        xml_out_dir: Path, skip_existing: bool,
+                        batch_size: int = BATCH_SIZE):
     img_paths = sorted(seq_img_dir.glob("*.jpg")) + sorted(seq_img_dir.glob("*.png"))
     if not img_paths:
         print(f"  [WARN] no images in {seq_img_dir}")
@@ -124,8 +125,8 @@ def run_detector_on_seq(model, transform, seq_img_dir: Path,
     device = next(model.parameters()).device
 
     total_frames = 0
-    for i in range(0, len(img_paths), BATCH_SIZE):
-        batch_paths = img_paths[i:i + BATCH_SIZE]
+    for i in range(0, len(img_paths), batch_size):
+        batch_paths = img_paths[i:i + batch_size]
 
         if skip_existing:
             missing = [p for p in batch_paths
@@ -178,6 +179,9 @@ def main():
                         help="Skip frames whose XML already exists (resume)")
     parser.add_argument("--seqs", nargs="+", default=None,
                         help="Process only these sequences (e.g. MOT17-02-FRCNN)")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
+                        help="Frames per forward pass (default 8; use 1-2 on "
+                             "small-memory devices like Jetson)")
     args = parser.parse_args()
 
     mot17_root = Path(args.mot17_root)
@@ -229,6 +233,7 @@ def main():
                 seq_img_dir=seq_dir / "img1",
                 xml_out_dir=xml_out_dir,
                 skip_existing=args.skip_existing,
+                batch_size=args.batch_size,
             )
             print(f"    Done: {n} frames → {xml_out_dir}")
 

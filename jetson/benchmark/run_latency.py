@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-E2E latency benchmark — Jetson Nano.
+E2E latency benchmark — Jetson Orin Nano.
 
 Five conditions (sequential, warmed-up):
   detector_only  — FasterRCNN (GPU) alone
@@ -11,7 +11,7 @@ Five conditions (sequential, warmed-up):
 
 Timing: wall-clock per frame, WARMUP frames discarded, N_FRAMES measured.
 GPU conditions include torch.cuda.synchronize() before/after each call.
-Results saved to motivation_study/results/latency.json.
+Results saved to jetson/benchmark/results/latency.json.
 """
 
 import json
@@ -34,22 +34,46 @@ import os
 # Point torch hub cache to the workspace so the container never downloads
 # fasterrcnn_mobilenet_v3_large_fpn at runtime (75 MB download on Jetson
 # causes OOM / heap corruption).  Pre-copy the .pth file there once.
-_ROOT_EARLY = Path(__file__).resolve().parent.parent
+_ROOT_EARLY = Path(__file__).resolve().parents[2]
 os.environ.setdefault("TORCH_HOME",
                       str(_ROOT_EARLY / "data" / "torch_hub"))
+
+# Import the XGBoost stack BEFORE torch: importing pandas/sklearn after torch
+# has been running a frame loop corrupts the glibc heap on Jetson ("corrupted
+# size vs. prev_size" abort in the xgboost_cpu condition). Harmless no-op if
+# the packages are not installed.
+# Set LAZY_XGB_IMPORT=1 to skip this and import lazily inside the xgboost_cpu
+# condition instead (the original protocol): whole-system RAM measured for that
+# condition then includes the import footprint, matching the paper's Fig 3a
+# accounting — at the cost of the occasional heap-corruption abort (just retry).
+if os.environ.get("LAZY_XGB_IMPORT") != "1":
+    for _mod in ("pandas", "scipy", "sklearn", "xgboost"):
+        try:
+            __import__(_mod)
+        except Exception:
+            pass
 
 import numpy as np
 import torch
 from PIL import Image
 from torchvision.models.detection import (
+    FasterRCNN_MobileNet_V3_Large_320_FPN_Weights,
     FasterRCNN_MobileNet_V3_Large_FPN_Weights,
+    fasterrcnn_mobilenet_v3_large_320_fpn,
     fasterrcnn_mobilenet_v3_large_fpn,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "estimator"))
 
-from iounet_inference import IoUPredictor, _roi_features, ROI_DIM, CONF_THR, MAX_BOXES
+from iounet_inference import (IoUPredictor, _roi_features, ROI_DIM,
+                              CONF_THR, CONF_THR_MOT17, MAX_BOXES)
+# This benchmark runs on MOT17 (SEQUENCE below). The IoU-Net/GFL GPU head scores
+# every box with score >= CONF_THR (up to MAX_BOXES). MOT17's calibrated threshold
+# is 0.1 (CONF_THR_MOT17); the module-level CONF_THR default (0.5) is the
+# UA-DETRAC/UAVDT value and under-counts RoIs here, shrinking the head cost and
+# throwing off Fig 2 vs the paper. Use the dataset-correct threshold.
+CONF_THR = CONF_THR_MOT17
 from gfl_inference import GFLPredictor
 from ptc_inference import PTCEstimator
 from feature_extractor import FrameFeatureExtractor, build_window_vector
@@ -94,7 +118,7 @@ class ResourceSampler:
 
     CPU and RAM also read from /proc as a fallback if tegrastats is absent.
 
-    tegrastats output example (Jetson Nano JetPack 4.x):
+    tegrastats output example (old JetPack 4.x rail names; on Orin the rail is VDD_IN and power comes from run_energy.py / run_resources.py):
       RAM 1821/3964MB ... GR3D_FREQ 98% ... CPU [45%@1479,...] ...
       POM_5V_IN 4791/4791 POM_5V_GPU 621/621 POM_5V_CPU 403/403
     """
@@ -103,7 +127,7 @@ class ResourceSampler:
     _GPU_RE  = re.compile(r'GR3D_FREQ\s+(\d+)%')
     _RAM_RE  = re.compile(r'RAM\s+(\d+)/(\d+)MB')
     _CPU_RE  = re.compile(r'CPU\s+\[([^\]]+)\]')
-    _PWR_RE  = re.compile(r'POM_5V_IN\s+(\d+)/')   # mW on Jetson Nano
+    _PWR_RE  = re.compile(r'POM_5V_IN\s+(\d+)/')   # mW (JetPack 4.x rail name, unused on Orin)
 
     def __init__(self, interval_ms: int = 200):
         self._interval_ms = interval_ms
@@ -215,8 +239,20 @@ class ResourceSampler:
 # ── Loaders ───────────────────────────────────────────────────────────────────
 
 def load_detector():
-    weights = FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT
-    model = fasterrcnn_mobilenet_v3_large_fpn(weights=weights).to(DEVICE).eval()
+    # The weak detector is the full-resolution FasterRCNN-MobileNetV3-L-FPN, the
+    # same model the rest of the repo uses (the "-320-" label elsewhere is only a
+    # folder name — the underlying model is full-res). The detector variant does
+    # not affect the paper's *relative* estimator-overhead conclusions; this is a
+    # system-performance benchmark. DETECTOR_RES=320 is available only for
+    # exploring how the detector floor shifts, not for reproduction.
+    res = os.environ.get("DETECTOR_RES", "full").lower()
+    if res == "320":
+        weights = FasterRCNN_MobileNet_V3_Large_320_FPN_Weights.DEFAULT
+        model = fasterrcnn_mobilenet_v3_large_320_fpn(weights=weights).to(DEVICE).eval()
+    else:
+        weights = FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT
+        model = fasterrcnn_mobilenet_v3_large_fpn(weights=weights).to(DEVICE).eval()
+    print(f"  Detector variant: {'320 (min=320)' if res=='320' else 'full-res (min=800)'}")
     return model, weights.transforms()
 
 
@@ -445,7 +481,20 @@ def run_xgboost_cpu(detector, xgb_pred, extractor, buf, gpu_cache):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+ALL_CONDITIONS = ["detector_only", "iounet_gpu", "gfl_gpu", "ptc_cpu", "xgboost_cpu"]
+
+
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--conditions", nargs="+", default=ALL_CONDITIONS,
+                        choices=ALL_CONDITIONS,
+                        help="subset of conditions to measure (default: all). "
+                             "The Appendix B Fig 4 motivation study uses "
+                             "'--conditions detector_only gfl_gpu'.")
+    args = parser.parse_args()
+    WANT = set(args.conditions)
+
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"Sequence : {SEQUENCE}")
@@ -461,7 +510,7 @@ def main():
     results   = {}
 
     # Load estimators one at a time and delete after use to minimise peak
-    # memory on Jetson Nano (4 GB shared CPU/GPU RAM).
+    # memory on Jetson (shared CPU/GPU RAM).
 
     (RESULTS_DIR / "timing.json").unlink(missing_ok=True)
 
@@ -472,6 +521,8 @@ def main():
     resource_results = {}
 
     def _measure(cond_name, cond_label, lats_fn):
+        if cond_name not in WANT:
+            return
         print(f"\n{'='*60}")
         print(f"Condition: {cond_label}")
         print(f"{'='*60}")
@@ -497,25 +548,29 @@ def main():
     _measure("detector_only", "Detector only (FasterRCNN, GPU)",
              lambda: run_detector_only(detector, gpu_cache))
 
-    iounet_head = _load_mlp_head(IoUPredictor, IOU_CKPT)
-    _measure("iounet_gpu", "Detector + IoUNet  (both GPU)",
-             lambda: run_neural_gpu("IoUNet", detector, iounet_head, gpu_cache))
-    del iounet_head
+    if "iounet_gpu" in WANT:
+        iounet_head = _load_mlp_head(IoUPredictor, IOU_CKPT)
+        _measure("iounet_gpu", "Detector + IoUNet  (both GPU)",
+                 lambda: run_neural_gpu("IoUNet", detector, iounet_head, gpu_cache))
+        del iounet_head
 
-    gfl_head = _load_mlp_head(GFLPredictor, GFL_CKPT)
-    _measure("gfl_gpu", "Detector + GFL     (both GPU)",
-             lambda: run_neural_gpu("GFL", detector, gfl_head, gpu_cache))
-    del gfl_head
+    if "gfl_gpu" in WANT:
+        gfl_head = _load_mlp_head(GFLPredictor, GFL_CKPT)
+        _measure("gfl_gpu", "Detector + GFL     (both GPU)",
+                 lambda: run_neural_gpu("GFL", detector, gfl_head, gpu_cache))
+        del gfl_head
 
-    ptc_est = PTCEstimator(conf_thr=PTC_CONF_THR)
-    _measure("ptc_cpu", "Detector (GPU) + PTC-IoU (CPU)",
-             lambda: run_ptc_cpu(detector, ptc_est, gpu_cache))
-    del ptc_est
+    if "ptc_cpu" in WANT:
+        ptc_est = PTCEstimator(conf_thr=PTC_CONF_THR)
+        _measure("ptc_cpu", "Detector (GPU) + PTC-IoU (CPU)",
+                 lambda: run_ptc_cpu(detector, ptc_est, gpu_cache))
+        del ptc_est
 
-    xgb_pred, extractor, buf = load_xgboost()
-    _measure("xgboost_cpu", "Detector (GPU) + XGBoost (CPU)",
-             lambda: run_xgboost_cpu(detector, xgb_pred, extractor, buf, gpu_cache))
-    del xgb_pred, extractor, buf
+    if "xgboost_cpu" in WANT:
+        xgb_pred, extractor, buf = load_xgboost()
+        _measure("xgboost_cpu", "Detector (GPU) + XGBoost (CPU)",
+                 lambda: run_xgboost_cpu(detector, xgb_pred, extractor, buf, gpu_cache))
+        del xgb_pred, extractor, buf
 
     # ── Summary — latency ─────────────────────────────────────────────────────
     det_mean = results["detector_only"]["mean_ms"]
@@ -550,13 +605,19 @@ def main():
     lat_out = RESULTS_DIR / "latency.json"
     lat_out.write_text(json.dumps(results, indent=2))
 
-    res_out = RESULTS_DIR / "resources.json"
+    # NOTE: write the in-process sampler's numbers to a SEPARATE file, not
+    # resources.json. Inside the Docker container there is no tegrastats, so this
+    # sampler only has CPU/RAM (via /proc) and no GPU/power. The authoritative
+    # resources.json is produced by the HOST-side run_resources.py (which does
+    # have tegrastats). Writing here to resources.json would race with — and
+    # clobber — the host's GPU data when both run for Fig 3.
+    res_out = RESULTS_DIR / "resources_inproc.json"
     res_out.write_text(json.dumps(resource_results, indent=2))
 
     print(f"\nLatency  → {lat_out}")
-    print(f"Resources → {res_out}")
+    print(f"Resources (in-process, CPU/RAM only) → {res_out}")
 
-    # Skip Python/CUDA cleanup to avoid heap-corruption crash on Jetson Nano.
+    # Skip Python/CUDA cleanup to avoid heap-corruption crash on Jetson.
     # All results are already written to disk above.
     import os; os._exit(0)
 

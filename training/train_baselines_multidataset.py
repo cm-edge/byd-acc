@@ -38,7 +38,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(PROJECT_ROOT / "dataset"))
 
-from dataset_adapters import get_adapter
+from adapters import get_adapter
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CONF_THR  = 0.1

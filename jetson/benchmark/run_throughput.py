@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput benchmark — Jetson Nano.
+Throughput benchmark — Jetson Orin Nano.
 
 Measures maximum sustained frames-per-second for each condition.
 200 frames, sent as fast as possible (overloaded / no throttling).
@@ -16,7 +16,7 @@ CPU estimators (ptc_cpu, xgboost_cpu):
                  CPU runs est[N-1] concurrently. GPU is the bottleneck;
                  CPU estimator adds near-zero latency to throughput.
 
-Results saved to motivation_study/results/throughput.json.
+Results saved to jetson/benchmark/results/throughput.json.
 """
 
 import json
@@ -34,22 +34,38 @@ if _HOST_PKGS not in sys.path:
 
 import os
 
-_ROOT_EARLY = Path(__file__).resolve().parent.parent
+_ROOT_EARLY = Path(__file__).resolve().parents[2]
 os.environ.setdefault("TORCH_HOME",
                       str(_ROOT_EARLY / "data" / "torch_hub"))
+
+# Import the XGBoost stack BEFORE torch: importing pandas/sklearn after torch
+# has been running a frame loop corrupts the glibc heap on Jetson ("corrupted
+# size vs. prev_size" abort in the xgboost conditions). Harmless no-op if
+# the packages are not installed.
+for _mod in ("pandas", "scipy", "sklearn", "xgboost"):
+    try:
+        __import__(_mod)
+    except Exception:
+        pass
 
 import numpy as np
 import torch
 from PIL import Image
 from torchvision.models.detection import (
+    FasterRCNN_MobileNet_V3_Large_320_FPN_Weights,
     FasterRCNN_MobileNet_V3_Large_FPN_Weights,
+    fasterrcnn_mobilenet_v3_large_320_fpn,
     fasterrcnn_mobilenet_v3_large_fpn,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "estimator"))
 
-from iounet_inference import IoUPredictor, _roi_features, ROI_DIM, CONF_THR, MAX_BOXES
+from iounet_inference import (IoUPredictor, _roi_features, ROI_DIM,
+                              CONF_THR, CONF_THR_MOT17, MAX_BOXES)
+# MOT17 benchmark → use the dataset-correct box threshold 0.1 (CONF_THR_MOT17),
+# not the generic 0.5. See run_latency.py for the full rationale.
+CONF_THR = CONF_THR_MOT17
 from gfl_inference import GFLPredictor
 from ptc_inference import PTCEstimator
 from feature_extractor import FrameFeatureExtractor, build_window_vector
@@ -89,8 +105,18 @@ _SENTINEL = object()   # signals consumer thread to stop
 # ── Loaders ───────────────────────────────────────────────────────────────────
 
 def load_detector():
-    weights = FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT
-    model = fasterrcnn_mobilenet_v3_large_fpn(weights=weights).to(DEVICE).eval()
+    # Full-resolution FasterRCNN-MobileNetV3-L-FPN — same model the rest of the
+    # repo uses. The detector variant does not affect the paper's relative
+    # estimator-overhead conclusions. DETECTOR_RES=320 exists only for exploring
+    # the detector floor, not for reproduction.
+    res = os.environ.get("DETECTOR_RES", "full").lower()
+    if res == "320":
+        weights = FasterRCNN_MobileNet_V3_Large_320_FPN_Weights.DEFAULT
+        model = fasterrcnn_mobilenet_v3_large_320_fpn(weights=weights).to(DEVICE).eval()
+    else:
+        weights = FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT
+        model = fasterrcnn_mobilenet_v3_large_fpn(weights=weights).to(DEVICE).eval()
+    print(f"  Detector variant: {'320 (min=320)' if res=='320' else 'full-res (min=800)'}")
     return model, weights.transforms()
 
 
@@ -364,6 +390,18 @@ def run_pipelined_xgboost_cpu(detector, xgb_pred, extractor, buf, gpu_cache):
 def main():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    import argparse
+    _ALL = ["iounet_gpu", "gfl_gpu", "ptc_cpu_seq", "ptc_cpu_pipelined",
+            "xgboost_cpu_seq", "xgboost_cpu_pipelined"]
+    _ap = argparse.ArgumentParser()
+    _ap.add_argument("--conditions", nargs="+", default=_ALL,
+                     help="subset of conditions to run (default: all). "
+                          "XGBoost load can segfault after other conditions on Jetson; "
+                          "run it alone with '--conditions xgboost_cpu_seq xgboost_cpu_pipelined'.")
+    _ap.add_argument("--merge", action="store_true",
+                     help="merge into existing throughput.json instead of overwriting")
+    WANT = set(_ap.parse_args().conditions)
+
     print(f"Sequence : {SEQUENCE}")
     print(f"Device   : {DEVICE}")
     print(f"Frames   : {N_FRAMES}  (warmup={WARMUP})\n")
@@ -377,7 +415,7 @@ def main():
     results   = {}
 
     # Each condition loads its estimator on demand and deletes it afterwards
-    # to keep peak GPU/CPU memory as low as possible on Jetson Nano (4 GB shared).
+    # to keep peak GPU/CPU memory as low as possible on Jetson (shared CPU/GPU RAM).
 
     (RESULTS_DIR / "timing_throughput.json").unlink(missing_ok=True)
 
@@ -388,46 +426,50 @@ def main():
         write_marker(f"{key}_start")
         fps, elapsed = runner_fn()   # runners now return (fps, elapsed_s)
         write_marker(f"{key}_end")
-        # Throughput stats: treat each frame as one observation for interval plots
-        frame_ms = 1000.0 / fps
         results[key] = {
             "fps":           round(fps, 4),
             "elapsed_s":     round(elapsed, 3),
-            "frame_ms_mean": round(frame_ms, 3),
-            # Approximate std assuming Poisson-like timing variance (~3% CoV)
-            "frame_ms_std":  round(frame_ms * 0.03, 3),
+            "frame_ms_mean": round(1000.0 / fps, 3),
             "n_frames":      N_FRAMES,
         }
         torch.cuda.empty_cache()
         time.sleep(2)
 
     # ── IoUNet (GPU) ──────────────────────────────────────────────────────────
-    iounet_head = _load_mlp_head(IoUPredictor, IOU_CKPT)
-    _run("iounet_gpu", "Detector + IoUNet  (both GPU, sequential)",
-         lambda: run_seq_neural_gpu("IoUNet", detector, iounet_head, gpu_cache))
-    del iounet_head
+    if "iounet_gpu" in WANT:
+        iounet_head = _load_mlp_head(IoUPredictor, IOU_CKPT)
+        _run("iounet_gpu", "Detector + IoUNet  (both GPU, sequential)",
+             lambda: run_seq_neural_gpu("IoUNet", detector, iounet_head, gpu_cache))
+        del iounet_head
 
     # ── GFL (GPU) ─────────────────────────────────────────────────────────────
-    gfl_head = _load_mlp_head(GFLPredictor, GFL_CKPT)
-    _run("gfl_gpu", "Detector + GFL     (both GPU, sequential)",
-         lambda: run_seq_neural_gpu("GFL", detector, gfl_head, gpu_cache))
-    del gfl_head
+    if "gfl_gpu" in WANT:
+        gfl_head = _load_mlp_head(GFLPredictor, GFL_CKPT)
+        _run("gfl_gpu", "Detector + GFL     (both GPU, sequential)",
+             lambda: run_seq_neural_gpu("GFL", detector, gfl_head, gpu_cache))
+        del gfl_head
 
     # ── PTC (CPU) — sequential + pipelined ───────────────────────────────────
-    ptc_est = PTCEstimator(conf_thr=PTC_CONF_THR)
-    _run("ptc_cpu_seq",      "Detector (GPU) + PTC-IoU (CPU, sequential)",
-         lambda: run_seq_ptc_cpu(detector, ptc_est, gpu_cache))
-    _run("ptc_cpu_pipelined","Detector (GPU) + PTC-IoU (CPU, pipelined)",
-         lambda: run_pipelined_ptc_cpu(detector, ptc_est, gpu_cache))
-    del ptc_est
+    if {"ptc_cpu_seq", "ptc_cpu_pipelined"} & WANT:
+        ptc_est = PTCEstimator(conf_thr=PTC_CONF_THR)
+        if "ptc_cpu_seq" in WANT:
+            _run("ptc_cpu_seq",      "Detector (GPU) + PTC-IoU (CPU, sequential)",
+                 lambda: run_seq_ptc_cpu(detector, ptc_est, gpu_cache))
+        if "ptc_cpu_pipelined" in WANT:
+            _run("ptc_cpu_pipelined","Detector (GPU) + PTC-IoU (CPU, pipelined)",
+                 lambda: run_pipelined_ptc_cpu(detector, ptc_est, gpu_cache))
+        del ptc_est
 
     # ── XGBoost (CPU) — sequential + pipelined ───────────────────────────────
-    xgb_pred, extractor, buf = load_xgboost()
-    _run("xgboost_cpu_seq",      "Detector (GPU) + XGBoost (CPU, sequential)",
-         lambda: run_seq_xgboost_cpu(detector, xgb_pred, extractor, buf, gpu_cache))
-    _run("xgboost_cpu_pipelined","Detector (GPU) + XGBoost (CPU, pipelined)",
-         lambda: run_pipelined_xgboost_cpu(detector, xgb_pred, extractor, buf, gpu_cache))
-    del xgb_pred, extractor, buf
+    if {"xgboost_cpu_seq", "xgboost_cpu_pipelined"} & WANT:
+        xgb_pred, extractor, buf = load_xgboost()
+        if "xgboost_cpu_seq" in WANT:
+            _run("xgboost_cpu_seq",      "Detector (GPU) + XGBoost (CPU, sequential)",
+                 lambda: run_seq_xgboost_cpu(detector, xgb_pred, extractor, buf, gpu_cache))
+        if "xgboost_cpu_pipelined" in WANT:
+            _run("xgboost_cpu_pipelined","Detector (GPU) + XGBoost (CPU, pipelined)",
+                 lambda: run_pipelined_xgboost_cpu(detector, xgb_pred, extractor, buf, gpu_cache))
+        del xgb_pred, extractor, buf
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -442,6 +484,10 @@ def main():
               f"{vals['frame_ms_mean']:>7.1f}ms  {speedup:>7.2f}×")
 
     out = RESULTS_DIR / "throughput.json"
+    if _ap.parse_args().merge and out.exists():
+        merged = json.loads(out.read_text())
+        merged.update(results)
+        results = merged
     out.write_text(json.dumps(results, indent=2))
     print(f"\nResults → {out}")
     import os; os._exit(0)

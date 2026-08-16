@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Estimator-only latency benchmark on Jetson Nano.
+Estimator-only latency benchmark on Jetson Orin Nano.
 
 Measures the incremental inference overhead of each estimator AFTER the detector
 has already run (detector latency is NOT included in any reported number).
 
-Three estimators:
-  - gfl_qfl_quality_head.pth  : RoI pool + GFL 3-layer MLP     (GPU)
-  - iou_net_jitter.pth        : RoI pool + IoUNet 3-layer MLP   (GPU)
-  - w7_h1_xgboost_clf         : XGBoost on hand-crafted features (CPU)
+Three estimators (weights shipped in weights/):
+  - weights/neural/gfl.pth      : RoI pool + GFL 3-layer MLP     (GPU)
+  - weights/neural/iou_net.pth  : RoI pool + IoUNet 3-layer MLP  (GPU)
+  - weights/xgboost/predictor.pkl : XGBoost on hand-crafted features (CPU)
 
 Neural estimators share the FasterRCNN backbone via a forward hook so the
 backbone never runs twice. XGBoost operates on a random feature vector of the
@@ -17,33 +17,10 @@ here; we only care about inference time.
 """
 
 import json
+import pickle
 import sys
 import time
 from pathlib import Path
-from unittest.mock import MagicMock
-
-# If running inside the jetson-inference Docker container, xgboost lives on
-# the host's user site-packages which is mounted at /host-packages.
-# Append it so the container's native torch/torchvision stay first in sys.path.
-_HOST_PKGS = "/host-packages"
-if _HOST_PKGS not in sys.path:
-    sys.path.append(_HOST_PKGS)
-
-# xgboost checks scipy sparse types via isinstance() at runtime.
-# Provide real empty stub classes so isinstance() doesn't crash.
-class _SparseMod(MagicMock):
-    class csr_matrix: pass
-    class csc_matrix: pass
-    class csr_array: pass
-    class csc_array: pass
-    def issparse(self, x): return False
-
-_sparse_mod = _SparseMod()
-_mock = MagicMock()
-_mock.sparse = _sparse_mod
-sys.modules.setdefault('scipy', _mock)
-sys.modules.setdefault('scipy.sparse', _sparse_mod)
-sys.modules.setdefault('scipy.special', MagicMock())
 
 import numpy as np
 import torch
@@ -62,7 +39,7 @@ from gfl_inference import GFLPredictor
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MOT17_ROOT  = ROOT / "data" / "MOT17"
-SEQUENCE    = "MOT17-04-DPM"
+SEQUENCE    = "MOT17-02-FRCNN"
 N_FRAMES    = 150
 WARMUP      = 20
 RESULTS_DIR = Path(__file__).parent / "results"
@@ -70,10 +47,10 @@ RESULTS_DIR = Path(__file__).parent / "results"
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 N_GPU_CACHE = 30
 
-GFL_CKPT = ROOT / "estimator/weights/neural/gfl_qfl_quality_head.pth"
-IOU_CKPT = ROOT / "estimator/weights/neural/iou_net_jitter.pth"
-XGB_CKPT = ROOT / "estimator/weights/xgboost_booster.ubj"  # native booster, no sklearn needed
-XGB_N_FEATURES = 196  # window=7 × 28 features
+GFL_CKPT = ROOT / "weights/neural/gfl.pth"
+IOU_CKPT = ROOT / "weights/neural/iou_net.pth"
+XGB_CKPT = ROOT / "weights/xgboost/predictor.pkl"
+XGB_N_FEATURES = 196  # window=7 x 28 features
 
 _KEY_MAP = {"fc1": "net.0", "fc2": "net.2", "fc3": "net.4"}
 
@@ -110,9 +87,10 @@ def load_iou_head():
 
 
 def load_xgboost():
-    booster = xgb.Booster()
-    booster.load_model(str(XGB_CKPT))
-    print(f"  Loaded XGBoost booster: {XGB_CKPT.name}  (n_features={XGB_N_FEATURES})")
+    with open(XGB_CKPT, "rb") as f:
+        bundle = pickle.load(f)
+    booster = bundle["model"].get_booster()
+    print(f"  Loaded XGBoost booster from {XGB_CKPT.name}  (n_features={XGB_N_FEATURES})")
     return booster
 
 

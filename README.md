@@ -1,18 +1,19 @@
 # Beyond Accuracy: Rethinking Resource-Efficient Correctness Estimation in Edge Detection
 
-Code for the paper **"Beyond Accuracy: Rethinking Resource-Efficient Correctness Estimation in Edge Detection"** (Paper #53).
+Code and reproduction package for the paper **"Beyond Accuracy: Rethinking Resource-Efficient Correctness Estimation in Edge Detection"** (Paper #53).
 
 ---
 
 ## Overview
 
-Online object detectors at the edge need a per-frame signal of how trustworthy their predictions are, with no access to ground truth.  We propose **PTC-IoU** — a deterministic, non-learned estimator built from temporal consistency of the detector's output stream.  It matches two established learned baselines (IoU-Net, GFL) on estimation quality while adding only **0.6 ms per frame** (≈ 20× less than a co-located GPU head).
+An object detector deployed at the edge needs a per-frame signal of how much its predictions can be trusted, but it has no ground truth to check against. We propose **PTC-IoU**, a deterministic, non-learned estimator built from the temporal consistency of the detector's own output stream. It matches two learned baselines (IoU-Net, GFL) on estimation quality, while its cost is closed-form box arithmetic that runs on the otherwise idle CPU instead of the saturated GPU.
 
 ---
 
 ## Repository layout
 
 ```
+├── REPRODUCING.md      Step-by-step manual for the Jetson results (start here for Fig 2/3/4)
 ├── estimator/          Core library: PTC-IoU, IoU-Net, GFL, XGBoost (server + Jetson)
 ├── detection/          Regenerate weak/strong detections in-repo (UA-DETRAC, UAVDT)
 ├── training/           Train baselines from scratch (requires raw video frames + GPU)
@@ -34,24 +35,28 @@ Online object detectors at the edge need a per-frame signal of how trustworthy t
 
 ---
 
-## Quickstart — server-side results
+## Quickstart — server-side results (Table 2, Fig 5, Fig 6)
 
 ```bash
 # 1. Install
 pip install -r requirements.txt
 
-# 2. Download datasets → see data/README.md
+# 2. Download datasets
+#    See data/README.md for layout and links.
+#    For the MOT17 part, dataset/README_mot17.md has the full walkthrough.
 
-# 3. Generate detections (UA-DETRAC, UAVDT → see detection/README.md;
-#    MOT17 uses a separate script)
+# 3. Generate detections
 python detection/run_detection.py --dataset ua-detrac
 python detection/run_detection.py --dataset uavdt
-python scoring/compute_mot17_detections.py
+python scoring/compute_mot17_detections.py --skip-existing
 
-# 4. Compute scores (pre-trained weights already in weights/)
+# 4. Compute per-frame scores (pre-trained weights already in weights/)
+python scoring/compute_derived.py
 python scoring/compute_ptc.py
 python scoring/compute_iounet_gfl.py --method both
 python scoring/compute_xgboost.py
+python scoring/compute_mot17_iounet_gfl.py --method both
+python scoring/compute_mot17_routing.py
 
 # 5. Reproduce
 python reproduce/tab2.py          # Table 2
@@ -59,21 +64,18 @@ python reproduce/fig5.py          # Appendix C Fig 5
 python reproduce/fig6.py          # Appendix C Fig 6
 ```
 
-## Quickstart — Jetson results
+## Quickstart — Jetson results (Fig 2, Fig 3, Fig 4)
 
-Requires NVIDIA Jetson Orin Nano.  See `jetson/README.md` for Docker setup.
+Requires an NVIDIA Jetson Orin Nano. **Follow [`REPRODUCING.md`](REPRODUCING.md) step by step.** The system-performance numbers depend on the machine state (power mode, CPU clocks, background load), and that manual pins the state down and gives the expected value and tolerance for every quantity. `jetson/README.md` documents the Docker environment and the individual benchmark scripts.
+
+The benchmark runs write their result JSONs to `jetson/benchmark/results/`
+(not tracked by git). After measuring, plot the figures with:
 
 ```bash
-# Fig 2 (latency + throughput) — inside container:
-python reproduce/jetson/fig2.py
-
-# Fig 3 (resources + energy) — two terminals:
-# Terminal 1 (host):      python reproduce/jetson/fig3.py --host-monitor
-# Terminal 2 (container): python reproduce/jetson/fig3.py --container-bench
-# Then:                   python reproduce/jetson/fig3.py --plot-only
+python reproduce/jetson/fig2.py --plot-only
+python reproduce/jetson/fig3.py --plot-only
+python reproduce/jetson/fig4.py --plot-only
 ```
-
-Full instructions: `reproduce/README.md`
 
 ---
 
@@ -91,9 +93,9 @@ Full instructions: `reproduce/README.md`
 ## Citation
 
 ```bibtex
-@inproceedings{ptciou2026,
-  title     = {Beyond Accuracy: Rethinking Resource-Efficient Correctness Estimation in Edge Detection},
-  booktitle = {TODO},
-  year      = {2026},
+@misc{ptciou2026,
+  title = {Beyond Accuracy: Rethinking Resource-Efficient Correctness Estimation in Edge Detection},
+  year  = {2026},
+  note  = {under review},
 }
 ```

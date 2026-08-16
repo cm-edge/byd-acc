@@ -7,7 +7,7 @@ Collects CPU / GPU / RAM metrics via tegrastats for each of the 5 conditions:
 
 Usage:
   # Terminal 1 (host):
-      python3 motivation_study/run_resources.py
+      python3 jetson/benchmark/run_resources.py
 
   # Terminal 2 (container):
       python3 run_latency.py
@@ -16,7 +16,7 @@ run_latency.py writes wall-clock timestamps to results/timing.json as it
 progresses.  This script polls that file, then slices the tegrastats log
 by condition and aggregates mean/std per metric.
 
-Results saved to motivation_study/results/resources.json.
+Results saved to jetson/benchmark/results/resources.json.
 """
 
 import argparse
@@ -41,6 +41,12 @@ CONDITIONS_LATENCY = [
     "gfl_gpu",
     "ptc_cpu",
     "xgboost_cpu",
+]
+
+# Conditions for the Appendix B Fig 4 motivation study (detector vs co-located GFL)
+CONDITIONS_MOTIVATION = [
+    "detector_only",
+    "gfl_gpu",
 ]
 
 # Conditions for run_throughput.py (includes seq + pipelined)
@@ -136,7 +142,8 @@ def main():
                         help="tegrastats sampling interval in ms (default 200)")
     parser.add_argument("--no-tegrastats", action="store_true",
                         help="skip tegrastats (parse existing log file)")
-    parser.add_argument("--mode", choices=["latency", "throughput"], default="latency",
+    parser.add_argument("--mode", choices=["latency", "throughput", "motivation"],
+                        default="latency",
                         help="which benchmark to monitor (default: latency)")
     args = parser.parse_args()
 
@@ -146,6 +153,12 @@ def main():
         TIMING_FILE = RESULTS_DIR / "timing_throughput.json"
         OUT_FILE    = RESULTS_DIR / "resources_throughput.json"
         label       = "run_throughput.py"
+    elif args.mode == "motivation":
+        # Appendix B Fig 4: detector-only vs detector+GFL (co-located on GPU).
+        CONDITIONS  = CONDITIONS_MOTIVATION
+        TIMING_FILE = RESULTS_DIR / "timing.json"
+        OUT_FILE    = RESULTS_DIR / "motivation_results.json"
+        label       = "run_latency.py --conditions detector_only gfl_gpu"
     else:
         CONDITIONS  = CONDITIONS_LATENCY
         TIMING_FILE = RESULTS_DIR / "timing.json"
@@ -236,7 +249,22 @@ def main():
 
     # ── Merge with latency/throughput results ────────────────────────────────
     perf_file = RESULTS_DIR / ("throughput.json" if args.mode == "throughput" else "latency.json")
-    if perf_file.exists():
+    # The benchmark writes this file only AFTER its last timing marker, so wait
+    # until the file on disk is newer than that marker. Merging an older file
+    # would mix in numbers from a previous run.
+    fresh = args.no_tegrastats  # replay mode reads whatever is on disk
+    if not fresh:
+        last_marker_t = max(markers.values())
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if perf_file.exists() and perf_file.stat().st_mtime >= last_marker_t - 1.0:
+                fresh = True
+                break
+            time.sleep(0.5)
+        if not fresh:
+            print(f"WARNING: {perf_file.name} was not updated by this run within 120 s; "
+                  f"skipping the latency/fps merge so stale numbers do not leak in.")
+    if fresh and perf_file.exists():
         perf = json.loads(perf_file.read_text())
         for cond in CONDITIONS:
             if cond in perf and cond in results:
@@ -246,6 +274,26 @@ def main():
                 else:
                     results[cond]["latency_mean_ms"] = perf[cond].get("mean_ms")
                     results[cond]["latency_p95_ms"]  = perf[cond].get("p95_ms")
+
+    # ── Motivation mode: reshape to the schema reproduce/jetson/fig4.py reads ──
+    if args.mode == "motivation":
+        _KEY = {
+            "detector_only": "detector_only",
+            "gfl_gpu":       "detector_plus_estimator_gpu",
+        }
+        motivation = {}
+        for cond, out_key in _KEY.items():
+            r = results.get(cond, {})
+            motivation[out_key] = {
+                "gpu_util_mean":   r.get("gpu_pct_mean"),
+                "gpu_util_std":    r.get("gpu_pct_std"),
+                "cpu_util_mean":   r.get("cpu_pct_mean_mean"),
+                "cpu_util_std":    r.get("cpu_pct_mean_std"),
+                "ram_mb_mean":     r.get("ram_used_mb_mean"),
+                "ram_used_mb_std": r.get("ram_used_mb_std"),
+                "latency_mean_ms": r.get("latency_mean_ms"),
+            }
+        results = motivation
 
     out_path = OUT_FILE
     out_path.write_text(json.dumps(results, indent=2))

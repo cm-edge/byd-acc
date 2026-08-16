@@ -11,7 +11,7 @@ Prerequisites (host):
 
 Usage:
   # Terminal 1 (host):
-      python3 motivation_study/run_energy.py
+      python3 jetson/benchmark/run_energy.py
 
   # Terminal 2 (container):
       python3 run_latency.py
@@ -19,7 +19,7 @@ Usage:
 Requires run_latency.py to have already written results/timing.json
 (the timing markers it writes during each condition).
 
-Results saved to motivation_study/results/energy.json.
+Results saved to jetson/benchmark/results/energy.json.
 """
 
 import json

@@ -118,8 +118,8 @@ def plot(out_dir: Path):
         ("xgboost_cpu_seq",      "XGBoost\nseq."),
         ("xgboost_cpu_pipelined","XGBoost\npipe."),
     ]
-    gpu_baseline = tput.get("iounet_gpu", {}).get("fps_mean", 0)
-    fps_vals = [tput.get(k, {}).get("fps_mean", 0) for k, _ in tput_conditions]
+    gpu_baseline = tput.get("iounet_gpu", {}).get("fps", 0)
+    fps_vals = [tput.get(k, {}).get("fps", 0) for k, _ in tput_conditions]
     tc_labels = [l for _, l in tput_conditions]
     tc_colors = ["#4878CF", "#4878CF", "#4CAF50", "#4CAF50", "#D65F5F", "#D65F5F"]
 
